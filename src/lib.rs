@@ -31,6 +31,7 @@
 extern crate std;
 
 use core::fmt;
+use core::fmt::Write;
 
 /// Representation of a demangled symbol name.
 pub struct Demangle<'a> {
@@ -191,6 +192,55 @@ pub fn try_demangle(s: &str) -> Result<Demangle, TryDemangleError> {
     }
 }
 
+struct WriteAdaptor<'a> {
+    inner: &'a mut [u8]
+}
+
+impl<'a> core::fmt::Write for WriteAdaptor<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if s.len() > self.inner.len() {
+            return Err(core::fmt::Error);
+        }
+        let (left,right) = core::mem::replace(self, WriteAdaptor { inner: &mut [] }).inner.split_at_mut(s.len());
+        left.copy_from_slice(s.as_bytes());
+        *self = WriteAdaptor { inner: right };
+        Ok(())
+    }
+}
+
+/// C-style interface for demangling.
+/// Demangles symbol given in `mangled` argument into `out` buffer
+///
+/// Unsafe as it handles buffers by raw pointers.
+///
+/// Returns 0 if `mangled` is not Rust symbol or if `out` buffer is too small
+/// Returns 1 otherwise
+#[no_mangle]
+pub unsafe extern fn rustc_demangle(mangled: *const u8, out: *mut u8, out_size: usize) -> i64 {
+    // homebrew version of strlen
+    let mut mangled_len = 0;
+    while *(mangled.add(mangled_len)) != 0 {
+        mangled_len += 1;
+    }
+    let mangled_slice = core::slice::from_raw_parts(mangled, mangled_len);
+    let mangled_str = core::str::from_utf8(mangled_slice);
+    if mangled_str.is_err() {
+        return 0;
+    }
+    let mangled_str = mangled_str.unwrap();
+    match try_demangle(mangled_str) {
+        Ok(demangle) => {
+            let mut out_slice = core::slice::from_raw_parts_mut(out, out_size);
+            let mut out_adaptor = WriteAdaptor { inner: out_slice };
+            match write!(out_adaptor, "{:#}\0", demangle) {
+                Ok(_) => { return 1 },
+                Err(_) => { return 0 }
+            }
+        },
+        Err(_) => { return 0 }
+    }
+}
+
 impl<'a> Demangle<'a> {
     /// Returns the underlying string that's being demangled.
     pub fn as_str(&self) -> &'a str {
@@ -301,6 +351,7 @@ impl<'a> fmt::Debug for Demangle<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std;
     use std::prelude::v1::*;
 
     macro_rules! t {
@@ -409,5 +460,79 @@ mod tests {
             2734cOsbE\n\
             5usage20h)3\0\0\0\0\0\0\07e2734cOsbE\
         ").to_string();
+    }
+
+    #[test]
+    fn demangle_c_str_large() {
+        let mangled = "_ZN4testE\0";
+        let mut out_buf = vec![42;8];
+        let res = unsafe { super::rustc_demangle(mangled.as_ptr(), out_buf.as_mut_ptr(), 8) };
+        assert_eq!(res, 1);
+        let out_str = std::str::from_utf8(&out_buf[..5]).unwrap();
+        assert_eq!(out_str, "test\0");
+    }
+
+    #[test]
+    fn demangle_c_str_exact() {
+        let mangled = "_ZN4testE\0";
+        let mut out_buf = vec![42;8];
+        let res = unsafe { super::rustc_demangle(mangled.as_ptr(), out_buf.as_mut_ptr(), 5) };
+        assert_eq!(res, 1);
+        let out_str = std::str::from_utf8(&out_buf).unwrap();
+        assert_eq!(out_str, "test\0***");
+    }
+
+    #[test]
+    fn demangle_c_str_small() {
+        let mangled = "_ZN4testE\0";
+        let mut out_buf = vec![42;8];
+        let res = unsafe { super::rustc_demangle(mangled.as_ptr(), out_buf.as_mut_ptr(), 4) };
+        assert_eq!(res, 0);
+        let out_str = std::str::from_utf8(&out_buf[4..]).unwrap();
+        assert_eq!(out_str, "****");
+    }
+
+    #[test]
+    fn demangle_c_str_smaller() {
+        let mangled = "_ZN4testE\0";
+        let mut out_buf = vec![42;8];
+        let res = unsafe { super::rustc_demangle(mangled.as_ptr(), out_buf.as_mut_ptr(), 3) };
+        assert_eq!(res, 0);
+        let out_str = std::str::from_utf8(&out_buf[3..]).unwrap();
+        assert_eq!(out_str, "*****");
+    }
+
+    #[test]
+    fn demangle_c_str_zero() {
+        let mangled = "_ZN4testE\0";
+        let mut out_buf = vec![42;8];
+        let res = unsafe { super::rustc_demangle(mangled.as_ptr(), out_buf.as_mut_ptr(), 0) };
+        assert_eq!(res, 0);
+        let out_str = std::str::from_utf8(&out_buf).unwrap();
+        assert_eq!(out_str, "********");
+    }
+
+    #[test]
+    fn demangle_c_str_not_rust_symbol() {
+        let mangled = "la la la\0";
+        let mut out_buf = vec![42;8];
+        let res = unsafe { super::rustc_demangle(mangled.as_ptr(), out_buf.as_mut_ptr(), 8) };
+        assert_eq!(res, 0);
+    }
+
+    #[test]
+    fn demangle_c_str_null() {
+        let mangled = "\0";
+        let mut out_buf = vec![42;8];
+        let res = unsafe { super::rustc_demangle(mangled.as_ptr(), out_buf.as_mut_ptr(), 8) };
+        assert_eq!(res, 0);
+    }
+
+    #[test]
+    fn demangle_c_str_invalid_utf8() {
+        let mangled = [116, 101, 115, 116, 165, 0];
+        let mut out_buf = vec![42;8];
+        let res = unsafe { super::rustc_demangle(mangled.as_ptr(), out_buf.as_mut_ptr(), 8) };
+        assert_eq!(res, 0);
     }
 }
